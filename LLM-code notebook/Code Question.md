@@ -6,7 +6,7 @@
 
 总览：[[03_LLM科研/00_总览/02_线上课总览/00_线上课总览|线上课总览]]
 
-相关章节：[[2.00_PyTorch_Warmup|00_PyTorch_Warmup]]、[[3.01_RMSNorm|01_RMSNorm]]、[[4.02_SwiGLU|02_SwiGLU]]、[[5.03_RoPE|03_RoPE]]
+相关章节：[[2.00_PyTorch_Warmup|00_PyTorch_Warmup]]、[[3.01_RMSNorm|01_RMSNorm]]、[[4.02_SwiGLU|02_SwiGLU]]、[[5.03_RoPE|03_RoPE]]、[[6.04_Attention_MHA_GQA|04_Attention_MHA_GQA]]
 
 标签：#LLM-Algo-LeetCode #PyTorch #代码细节 #CodeQuestion
 
@@ -462,6 +462,80 @@ reshape(batch, height * width, channels)
 permute 改维度顺序；reshape 合并或拆分维度。
 ```
 
+### `reshape` 能不能替代 `transpose`
+
+来源：[[6.04_Attention_MHA_GQA|04_Attention_MHA_GQA]]
+
+一句话答案：
+
+```text
+reshape 可以替代 view，但不能替代 transpose。
+```
+
+例子：
+
+```python
+output = output.transpose(1, 2).reshape(batch_size, seq_len, -1)
+```
+
+如果此时：
+
+```text
+output: [B, H, S, D]
+```
+
+目标是：
+
+```text
+[B, H, S, D]
+-> [B, S, H, D]
+-> [B, S, H * D]
+```
+
+不能直接：
+
+```python
+output = output.reshape(batch_size, seq_len, -1)
+```
+
+因为：
+
+```text
+reshape 只负责拆分/合并维度；
+transpose 才负责交换维度顺序。
+```
+
+### 多头注意力切的是哪个维度
+
+来源：[[6.04_Attention_MHA_GQA|04_Attention_MHA_GQA]]
+
+结论：
+
+```text
+标准 MHA/GQA 切的是 hidden_dim，不是 seq_len。
+```
+
+例子：
+
+```text
+x: [B, S, hidden_dim]
+hidden_dim = H * D
+```
+
+切头：
+
+```text
+[B, S, hidden_dim]
+-> [B, S, H, D]
+-> [B, H, S, D]
+```
+
+`S` 不变，意思是：
+
+```text
+每个 head 仍然能看完整的 S 个 token。
+```
+
 ### `reshape_for_broadcast`
 
 来源：[[5.03_RoPE|03_RoPE]]
@@ -567,6 +641,94 @@ grad_z = grad_output * mask
 ```text
 Linear 是矩阵乘法，所以反向还是矩阵乘法。
 ReLU 是逐元素函数，所以反向是逐元素乘法。
+```
+
+### `Q @ K.T` 到底让 Q 看到了什么
+
+来源：[[6.04_Attention_MHA_GQA|04_Attention_MHA_GQA]]
+
+一句话答案：
+
+```text
+Q 不是直接读取 K 的内容，而是和每个 K 做点积匹配，得到 token-token 分数表。
+```
+
+单个 head：
+
+```text
+Q: [S_q, D]
+K: [S_k, D]
+K.T: [D, S_k]
+
+Q @ K.T -> [S_q, S_k]
+```
+
+其中：
+
+```text
+scores[i, j] = q_i · k_j
+```
+
+含义：
+
+```text
+第 i 个 query token 对第 j 个 key token 的匹配分数。
+```
+
+容易误解的点：
+
+```text
+计算时用 D 维特征做点积；
+结果不是 hidden-hidden 表，而是 token-token 表。
+```
+
+### `scores` 是概率吗
+
+来源：[[6.04_Attention_MHA_GQA|04_Attention_MHA_GQA]]
+
+不是。
+
+```python
+scores = Q @ K.transpose(-2, -1)
+```
+
+得到的是 raw scores / logits。
+
+需要：
+
+```python
+probs = torch.softmax(scores, dim=-1)
+```
+
+之后才是注意力权重。
+
+流程：
+
+```text
+scores = 匹配分数
+probs = 看每个 token 的比例
+output = probs @ V
+```
+
+### `probs @ V` 为什么消掉的是 `S_k`
+
+来源：[[6.04_Attention_MHA_GQA|04_Attention_MHA_GQA]]
+
+形状：
+
+```text
+probs: [B, H, S_q, S_k]
+V:     [B, H, S_k, D]
+
+probs @ V -> [B, H, S_q, D]
+```
+
+原因：
+
+```text
+这是对所有被看的 token 做加权求和。
+S_k 是被加权汇总的 token 数，所以会被消掉。
+D 是每个 value 的内容维度，所以保留下来。
 ```
 
 ### bias 梯度为什么是 `sum(dim=0)`
@@ -731,6 +893,179 @@ shape 会变成：
 
 ```python
 torch.outer(freqs, t).T
+```
+
+## KV Cache 和 GQA 细节
+
+### `torch.cat([k_cache, xk], dim=2)` 在拼什么
+
+来源：[[6.04_Attention_MHA_GQA|04_Attention_MHA_GQA]]
+
+这里拼的是 token 维。
+
+如果：
+
+```text
+k_cache: [B, H_kv, 5, D]
+xk:      [B, H_kv, 1, D]
+```
+
+那么：
+
+```python
+xk = torch.cat([k_cache, xk], dim=2)
+```
+
+得到：
+
+```text
+xk: [B, H_kv, 6, D]
+```
+
+直观：
+
+```text
+旧 K: [token0, token1, token2, token3, token4]
+新 K: [token5]
+
+拼接后：
+[token0, token1, token2, token3, token4, token5]
+```
+
+### `torch.cat` 和 `torch.concat`
+
+来源：[[6.04_Attention_MHA_GQA|04_Attention_MHA_GQA]]
+
+在 PyTorch 里常用写法是：
+
+```python
+torch.cat([a, b], dim=...)
+```
+
+`torch.concat` 也可以用，基本等价，但教程和源码里更常见的是 `torch.cat`。
+
+### `repeat_kv` 为什么不是整体复制
+
+来源：[[6.04_Attention_MHA_GQA|04_Attention_MHA_GQA]]
+
+GQA 要的是分组共享。
+
+如果：
+
+```text
+H = 4
+H_kv = 2
+n_rep = 2
+```
+
+目标是：
+
+```text
+[KV0, KV1] -> [KV0, KV0, KV1, KV1]
+```
+
+而不是：
+
+```text
+[KV0, KV1] -> [KV0, KV1, KV0, KV1]
+```
+
+前者表示：
+
+```text
+Q0 Q1 -> KV0
+Q2 Q3 -> KV1
+```
+
+后者是交错共享，不是这里的 grouped query。
+
+### `hidden_states[:, :, None, :, :]` 为什么 `None` 放在这里
+
+来源：[[6.04_Attention_MHA_GQA|04_Attention_MHA_GQA]]
+
+原始：
+
+```text
+hidden_states: [B, H_kv, S, D]
+```
+
+插入新维度：
+
+```python
+hidden_states[:, :, None, :, :]
+```
+
+变成：
+
+```text
+[B, H_kv, 1, S, D]
+```
+
+然后：
+
+```python
+expand(B, H_kv, n_rep, S, D)
+```
+
+直观上：
+
+```text
+[
+  [KV0, KV0],
+  [KV1, KV1],
+]
+```
+
+最后：
+
+```python
+reshape(B, H_kv * n_rep, S, D)
+```
+
+得到：
+
+```text
+[KV0, KV0, KV1, KV1]
+```
+
+### 为什么先拼接 cache 再 `repeat_kv`
+
+来源：[[6.04_Attention_MHA_GQA|04_Attention_MHA_GQA]]
+
+正确顺序：
+
+```text
+旧 cache + 当前 K/V
+-> 得到完整但小的 K/V: [B, H_kv, S, D]
+-> 临时 repeat 成计算用 K/V: [B, H, S, D]
+```
+
+原因：
+
+```text
+KV Cache 里应该存小的 H_kv 版本。
+如果先 repeat 再存，cache 会变成 H 个 head，GQA 就不省显存了。
+```
+
+### prefill 和 decode
+
+来源：[[6.04_Attention_MHA_GQA|04_Attention_MHA_GQA]]
+
+简单记法：
+
+```text
+prefill = 读题阶段，一次性处理 prompt，建立初始 KV Cache。
+decode = 写答案阶段，每次生成 1 个新 token，并追加 KV Cache。
+```
+
+例子：
+
+```text
+prompt 长度 = 10
+prefill 后 K cache 的 S 维 = 10
+
+decode 又生成 3 个 token
+K cache 的 S 维 = 13
 ```
 
 ## 复数相关
